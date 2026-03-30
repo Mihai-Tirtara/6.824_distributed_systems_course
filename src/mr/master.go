@@ -123,8 +123,9 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	ret := false
 
-	// Your code here.
-	//Loop thorugh task list if all are set to done return true
+	if allTasksDone(m.mapTasks) && allTasksDone(m.reduceTasks) {
+		ret = true
+	}
 
 	return ret
 }

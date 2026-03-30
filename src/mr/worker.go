@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"time"
 )
 import "log"
@@ -25,82 +28,141 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	reguestArgs := RequestTaskArgs{}
-	requestRepy := RequestTaskReply{}
+	requestReply := RequestTaskReply{}
 	reportArgs := ReportTaskArgs{}
-	reportRepy := ReportTaskReply{}
+	reportReply := ReportTaskReply{}
 
 	// Your worker implementation here.
-	call("Master.RequestTask", &reguestArgs, &requestRepy)
+	call("Master.RequestTask", &reguestArgs, &requestReply)
 
-	if requestRepy.TaskType == MapTask {
-
-		//Create temporary files and encoders
-		tmpFiles := make([]*os.File, requestRepy.NReduce)
-		encoders := make([]*json.Encoder, requestRepy.NReduce)
-		for i := 0; i < requestRepy.NReduce; i++ {
-			tmpFiles[i], _ = os.CreateTemp("", "mr-tmp")
-			encoders[i] = json.NewEncoder(tmpFiles[i])
+	for requestReply.TaskType != ExitTask {
+		if requestReply.TaskType == MapTask {
+			mapTask(mapf, requestReply)
+			reportArgs.TaskID = requestReply.TaskID
+			reportArgs.TaskType = MapTask
+			call("Master.ReportTask", &reportArgs, &reportReply)
 		}
 
-		//Read the input and create key-value pair map
-		file, err := os.Open(requestRepy.Filename)
+		if requestReply.TaskType == ReduceTask {
+			reduceTask(reducef, requestReply)
+			reportArgs.TaskID = requestReply.TaskID
+			reportArgs.TaskType = ReduceTask
+			call("Master.ReportTask", &reportArgs, &reportReply)
+
+		}
+		if requestReply.TaskType == WaitTask {
+			time.Sleep(10 * time.Second)
+		}
+
+		call("Master.RequestTask", &reguestArgs, &requestReply)
+
+	}
+
+	return
+
+}
+
+func mapTask(mapf func(string, string) []KeyValue, requestReply RequestTaskReply) {
+	//Create temporary files and encoders
+	tmpFiles := make([]*os.File, requestReply.NReduce)
+	encoders := make([]*json.Encoder, requestReply.NReduce)
+	for i := 0; i < requestReply.NReduce; i++ {
+		tmpFiles[i], _ = os.CreateTemp("", "mr-tmp")
+		encoders[i] = json.NewEncoder(tmpFiles[i])
+	}
+
+	//Read the input and create key-value pair map
+	file, err := os.Open(requestReply.Filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", requestReply.Filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", requestReply.Filename)
+	}
+	err = file.Close()
+	if err != nil {
+		return
+	}
+	kva := mapf(requestReply.Filename, string(content))
+
+	//Loop through key-value pairs and encode in tmp files
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % requestReply.NReduce
+		encoders[bucket].Encode(&kv)
+	}
+
+	//Rename all tmp files
+	for i := 0; i < requestReply.NReduce; i++ {
+		tmpFiles[i].Close()
+		os.Rename(tmpFiles[i].Name(), fmt.Sprintf("mr-%d-%d", requestReply.TaskID, i))
+	}
+
+}
+
+func reduceTask(reducef func(string, []string) string, requestReply RequestTaskReply) {
+
+	var kva []KeyValue
+	oname := "mr-out-" + strconv.Itoa(requestReply.TaskID)
+	ofile, _ := os.Create(oname)
+
+	//Read all the intermediate files
+	pattern := filepath.Join("mr-*-+" + strconv.Itoa(requestReply.TaskID))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, filename := range matches {
+		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", requestRepy.Filename)
+			log.Fatalf("cannot open %v", filename)
 		}
-		content, err := ioutil.ReadAll(file)
-		if err != nil {
-			log.Fatalf("cannot read %v", requestRepy.Filename)
+		//Decode json
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
 		}
-		err = file.Close()
-		if err != nil {
-			return
-		}
-		kva := mapf(requestRepy.Filename, string(content))
+	}
+	//Sort by key
+	sort.Sort(ByKey(kva))
 
-		//Loop through key-value pairs and encode in tmp files
-		for _, kv := range kva {
-			bucket := ihash(kv.Key) % requestRepy.NReduce
-			encoders[bucket].Encode(&kv)
+	//Iterate by grouped key
+
+	groupStart := 0
+
+	for groupStart < len(kva) {
+		groupEnd := groupStart + 1
+		for groupEnd < len(kva) && kva[groupEnd].Key == kva[groupStart].Key {
+			groupEnd++
 		}
-
-		//Rename all tmp files
-		for i := 0; i < requestRepy.NReduce; i++ {
-			tmpFiles[i].Close()
-			os.Rename(tmpFiles[i].Name(), fmt.Sprintf("mr-%d-%d", requestRepy.TaskID, i))
+		values := []string{}
+		for k := groupStart; k < groupEnd; k++ {
+			values = append(values, kva[k].Value)
 		}
+		output := reducef(kva[groupStart].Key, values)
 
-		reportArgs.TaskID = requestRepy.TaskID
-		reportArgs.TaskType = MapTask
+		fmt.Fprintf(ofile, "%v %v\n", kva[groupStart].Key, output)
 
-		call("Master.ReportTask", &reportArgs, &reportRepy)
+		groupStart = groupEnd
 	}
 
-	if requestRepy.TaskType == ReduceTask {
-
-	}
-
-	if requestRepy.TaskType == WaitTask {
-		time.Sleep(10 * time.Second)
-	}
-
-	if requestRepy.TaskType == ExitTask {
-
-	}
-
-	//Our workers needs to request a task from master
-
-	//Depending on the task type:
-	//If task is Map: we call the map function write to a temporary file once it's done rename the file
-	// If task is wait: time.sleep(10)
-	//If task is reduce call reduce function on it
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
+	ofile.Close()
 }
 
 func CallExample() {
