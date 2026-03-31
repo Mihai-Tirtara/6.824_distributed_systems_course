@@ -89,8 +89,12 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	if args.TaskType == MapTask || args.TaskType == ReduceTask {
+	if args.TaskType == MapTask {
 		m.mapTasks[args.TaskID].State = Done
+		return nil
+	}
+	if args.TaskType == ReduceTask {
+		m.reduceTasks[args.TaskID].State = Done
 		return nil
 	}
 	return nil

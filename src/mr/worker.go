@@ -38,13 +38,13 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	reguestArgs := RequestTaskArgs{}
+	requestArgs := RequestTaskArgs{}
 	requestReply := RequestTaskReply{}
 	reportArgs := ReportTaskArgs{}
 	reportReply := ReportTaskReply{}
 
 	// Your worker implementation here.
-	call("Master.RequestTask", &reguestArgs, &requestReply)
+	call("Master.RequestTask", &requestArgs, &requestReply)
 
 	for requestReply.TaskType != ExitTask {
 		if requestReply.TaskType == MapTask {
@@ -62,11 +62,16 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		}
 		if requestReply.TaskType == WaitTask {
-			time.Sleep(10 * time.Second)
+			time.Sleep(1 * time.Second)
 		}
 
-		call("Master.RequestTask", &reguestArgs, &requestReply)
+		requestReply = RequestTaskReply{}
+		call("Master.RequestTask", &requestArgs, &requestReply)
 
+	}
+
+	if requestReply.TaskType == ExitTask {
+		os.Exit(0)
 	}
 
 	return
@@ -118,7 +123,7 @@ func reduceTask(reducef func(string, []string) string, requestReply RequestTaskR
 	ofile, _ := os.Create(oname)
 
 	//Read all the intermediate files
-	pattern := filepath.Join("mr-*-+" + strconv.Itoa(requestReply.TaskID))
+	pattern := fmt.Sprintf("mr-*-%d", requestReply.TaskID)
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		panic(err)
